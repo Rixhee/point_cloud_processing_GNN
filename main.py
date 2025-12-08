@@ -3,6 +3,7 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 import torch.nn.functional as F
+import torch.nn as nn
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
 
