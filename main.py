@@ -1,6 +1,8 @@
 import open3d as o3d
 import torch
 from torch_geometric.data import Data
+from torch_geometric.nn import MessagePassing
+import torch.nn.functional as F
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
 
@@ -51,3 +53,59 @@ def load_point_cloud_to_graph(path, k=16):
 
 
 print(load_point_cloud_to_graph(o3d.data.PLYPointCloud().path))
+
+
+class GNNLayer(MessagePassing):
+    """Graph Neural Network layer using message passing.
+
+    This layer aggregates information from neighboring nodes to update node features.
+    """
+
+    def __init__(self, in_channels, out_channels):
+        # Use mean aggregation to combine messages from neighbors
+        super().__init__(aggr="mean")
+        # MLP processes concatenated node and edge features
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels * 2, out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+        )
+
+    def forward(self, x, edge_index, edge_attr):
+        # Propagate messages along edges to update node features
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_j, x_i, edge_attr):
+        # Concatenate neighbor features with edge features
+        msg = torch.cat([x_j, edge_attr], dim=-1)
+        # Transform through MLP
+        return self.mlp(msg)
+
+
+class GNNEncoder(nn.Module):
+    """Multi-layer GNN encoder for point cloud feature extraction.
+
+    Stacks multiple GNN layers
+    """
+
+    def __init__(self, input_dim=6, hidden_dim=64, out_dim=32):
+        super().__init__()
+        self.layer1 = GNNLayer(input_dim + 3, hidden_dim)
+        self.layer2 = GNNLayer(hidden_dim + 3, hidden_dim)
+        self.layer3 = GNNLayer(hidden_dim + 3, out_dim)
+
+    def forward(self, data):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+
+        # First GNN layer + activation
+        x = self.layer1(x, edge_index, edge_attr)
+        x = F.relu(x)
+
+        # Second GNN layer + activation
+        x = self.layer2(x, edge_index, edge_attr)
+        x = F.relu(x)
+
+        # Third GNN layer (no activation - final embedding)
+        x = self.layer3(x, edge_index, edge_attr)
+
+        return x
