@@ -4,9 +4,13 @@ from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.optim as optim
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
 
+##################################
+# CREATING THE GRAPH.
+##################################
 
 def build_knn_graph(pos, k):
     # Use sklearn for KNN
@@ -23,7 +27,6 @@ def build_knn_graph(pos, k):
     edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
     return edge_index
 
-
 def load_point_cloud_to_graph(path, k=16):
     # Load point cloud
     pcd = o3d.io.read_point_cloud(path)
@@ -32,7 +35,7 @@ def load_point_cloud_to_graph(path, k=16):
 
     pos = torch.tensor(np.asarray(pcd.points), dtype=torch.float)
 
-    # Compute normals
+    # Compute normals -- vectors for directions of surfaces.
     if len(pcd.normals) == 0:
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
         pcd.orient_normals_consistent_tangent_plane(k=k)
@@ -55,6 +58,9 @@ def load_point_cloud_to_graph(path, k=16):
 
 print(load_point_cloud_to_graph(o3d.data.PLYPointCloud().path))
 
+##################################
+# CREATING THE GNN.
+##################################
 
 class GNNLayer(MessagePassing):
     """Graph Neural Network layer using message passing.
@@ -67,7 +73,7 @@ class GNNLayer(MessagePassing):
         super().__init__(aggr="mean")
         # MLP processes concatenated node and edge features
         self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2, out_channels),
+            nn.Linear(in_channels + 3, out_channels),
             nn.ReLU(),
             nn.Linear(out_channels, out_channels),
         )
@@ -91,9 +97,10 @@ class GNNEncoder(nn.Module):
 
     def __init__(self, input_dim=6, hidden_dim=64, out_dim=32):
         super().__init__()
-        self.layer1 = GNNLayer(input_dim + 3, hidden_dim)
-        self.layer2 = GNNLayer(hidden_dim + 3, hidden_dim)
-        self.layer3 = GNNLayer(hidden_dim + 3, out_dim)
+        self.layer1 = GNNLayer(input_dim, hidden_dim)
+        self.layer2 = GNNLayer(hidden_dim, hidden_dim)
+        self.layer3 = GNNLayer(hidden_dim, out_dim)
+
 
     def forward(self, data):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
@@ -110,3 +117,89 @@ class GNNEncoder(nn.Module):
         x = self.layer3(x, edge_index, edge_attr)
 
         return x
+    
+    
+##################################
+# CONTRASTIVE LEARNING 
+##################################
+
+def contrastive_cosine_loss(z1, z2, temperature=0.5):
+    """ 
+    Computes the contrastive loss between feature vectors.
+    z1, z2 -> our given feature vectors
+    temperature -> some arbitrary sensitivity that we have to difference (a.k.a tau).
+    """
+
+    # NORMALIZE THE FEATURE VECTORS.
+
+    z1_norm = F.normalize(z1, dim=-1)  # FEATURE VECTOR 1
+    z2_norm = F.normalize(z2, dim=-1)  # FEATURE VECTOR 2 
+
+    # COSINE SIMILARITY MATRIX.
+
+    # basically we just compute the similarity through the angle between them,
+    # representing what vectors are similar and which are different.
+    # S_{ij} = (z1_hat_i . z2_hat_j) / tau
+    sim_matrix = torch.matmul(z1_norm, z2_norm.T) / temperature  # [N, N]
+    positives = torch.diag(sim_matrix)    # Positive pairs are on the diagonal: S_{ii}
+
+    # COMPUTING THE DENOMINATOR
+
+    # we just look at the connection between the similarity between vector 1 and 2.
+    # sums over all columns of the similarity matrix for every row.
+    exp_sim = torch.exp(sim_matrix)  # e^{S_{ij}}
+    denominator = exp_sim.sum(dim=1)  # sum_j e^{S_{ij}}
+
+    # COMPUTE INFONCE LOSS -- actively pushing pairs closer and further away from eachother.
+    # l_i = -log( exp(S_{ii}) / sum_j exp(S_{ij}) ) # mathematical notation.
+    # every similar point should become 'closer' -- aka pointing more in the direction of the respective vector
+    loss_per_point = -torch.log(torch.exp(positives) / denominator)
+
+    # COMPUTE THE MEAN OVER EVERY POINT.
+    loss = loss_per_point.mean()
+    return loss
+
+# Small augmentation for contrastive learning
+def augment_point_cloud(data, jitter=0.01):
+    pos = data.pos.clone()
+    pos += torch.randn_like(pos) * jitter  # small random noise
+    x = torch.cat([pos, data.x[:, 3:]], dim=1)  # keep normals
+    row, col = data.edge_index
+    edge_attr = pos[row] - pos[col]
+    return Data(x=x, pos=pos, edge_index=data.edge_index, edge_attr=edge_attr)
+
+# Instantiate encoder and optimizer
+encoder = GNNEncoder(input_dim=6, hidden_dim=64, out_dim=32)
+encoder.train()
+optimizer = optim.Adam(encoder.parameters(), lr=1e-3)
+temperature = 0.5
+num_epochs = 100
+
+# Load point cloud
+data = load_point_cloud_to_graph(o3d.data.PLYPointCloud().path, k=16)
+
+# Training loop
+for epoch in range(num_epochs):
+    optimizer.zero_grad()
+    
+    # Two augmented views
+    data1 = augment_point_cloud(data)
+    data2 = augment_point_cloud(data)
+    
+    # Forward pass
+    z1 = encoder(data1)
+    z2 = encoder(data2)
+    
+    # Compute contrastive loss
+    loss = contrastive_cosine_loss(z1, z2, temperature)
+    
+    # Backpropagation
+    loss.backward()
+    optimizer.step()
+    
+    if (epoch+1) % 10 == 0:
+        print(f"Epoch {epoch+1}, Contrastive Loss: {loss.item():.4f}")
+
+
+    
+
